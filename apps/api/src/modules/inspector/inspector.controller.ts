@@ -30,7 +30,7 @@ export class InspectorController {
   @Header('Content-Type', 'text/csv; charset=utf-8')
   async exportTransaction(
     @Param('hash') hash: string,
-    @Res() reply: FastifyReply,
+    @Res({ passthrough: true }) reply: FastifyReply,
     @Query('network') network?: 'testnet' | 'mainnet',
   ) {
     const breakdown = await this.inspectorService.inspectTransaction(
@@ -41,7 +41,7 @@ export class InspectorController {
       'Content-Disposition',
       `attachment; filename="transaction-${hash.slice(0, 12)}.csv"`,
     );
-    return this.inspectorService.exportTransactionCsv();
+    return this.inspectorService.exportTransactionCsv(breakdown);
   }
 
   @Get('tx/:hash/events')

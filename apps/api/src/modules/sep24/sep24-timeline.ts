@@ -33,7 +33,7 @@ export interface TimelineExport {
 }
 
 const SENSITIVE_KEY_PATTERNS = [
-  /json/i,
+  /key/i,
   /jwt/i,
   /token/i,
   /secret/i,
@@ -79,9 +79,9 @@ function redactString(value: string): string {
     return value;
   }
   // Redact JWT tokens (3 base64url segments separated by dots).
-  const jwtRegex = /[aA-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[aA-zA-Z0-9_-]+/g;
+  const jwtRegex = /[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g;
   let out = value.replace(jwtRegex, REDACTED);
-  // Redact longer bearier-style tokens.
+  // Redact longer bearer-style tokens.
   out = out.replace(/Bearer\s+[A-Za-z0-9_.-]+/gi, `Bearer ${REDACTED}`);
   return out;
 }
