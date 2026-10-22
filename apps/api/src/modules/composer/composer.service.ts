@@ -2,10 +2,13 @@ import {
   BadRequestException,
   Injectable,
   Logger,
+  Inject,
+  forwardRef,
 } from '@nestjs/common';
 import {
   Account,
   Asset,
+  Address,
   BASE_FEE,
   Horizon,
   Keypair,
@@ -15,6 +18,7 @@ import {
   StrKey,
   Transaction,
   TransactionBuilder,
+  nativeToScVal,
   xdr,
 } from '@stellar/stellar-sdk';
 import { BuildTransactionDto, OperationDto } from './dto/build-transaction.dto';
@@ -22,6 +26,7 @@ import { SimulateTransactionDto } from './dto/simulate-transaction.dto';
 import { SimulateWithDiffDto, SimulationWithDiffResult, OperationEffect, StateDiff } from './dto/simulate-with-diff.dto';
 import { BenchmarkTransactionDto } from './dto/benchmark-transaction.dto';
 import { FeeBumpDto } from './dto/fee-bump.dto';
+import { ContractsService } from '../contracts/contracts.service';
 
 // ---------------------------------------------------------------------------
 // Static operation-type manifest returned by GET /composer/operations
@@ -224,14 +229,30 @@ export const OPERATION_MANIFEST = [
       { name: 'minAmountB', label: 'Minimum Received Asset B (pool order)', type: 'number', required: true, placeholder: '0' },
     ],
   },
+  {
+    type: 'invoke_host_function',
+    label: 'Invoke Host Function',
+    description: 'Invoke a Soroban smart contract host function',
+    soroban: {
+      requiresResourceFee: true,
+      requiresSimulation: true,
+    },
+    fields: [
+      { name: 'contractId', label: 'Contract ID', type: 'text', required: true, placeholder: 'C...' },
+      { name: 'functionName', label: 'Function Name', type: 'text', required: true, placeholder: 'transfer' },
+      { name: 'arguments', label: 'Arguments', type: 'scval-array', required: false, placeholder: '[]' },
+      { name: 'useAbi', label: 'Use ABI Validation', type: 'boolean', required: false, placeholder: 'true' },
+      { name: 'rawMode', label: 'Raw Arguments Mode', type: 'boolean', required: false, placeholder: 'false' },
+    ],
+  },
 ];
 
 export interface SimulationResult {
   success: boolean;
-  hash: string;
+  hash: string | null;
   fee: string | null;
   resultCodes: string | null;
-  operationResults: unknown | null;
+  operationResults: string[] | null;
   ledger: number | null;
 }
 
@@ -302,6 +323,19 @@ function validatePoolAmount(field: string, value: unknown, allowZero = false): s
 }
 
 function validatePriceRatio(field: string, value: any): { n: number; d: number } {
+  if (typeof value === 'string' || typeof value === 'number') {
+    const str = String(value);
+    if (!/^\d+(?:\.\d+)?$/.test(str)) {
+      throw new BadRequestException(`${field} numerator and denominator must be positive integers`);
+    }
+    const parts = str.split('.');
+    if (parts.length === 1) {
+      return { n: Number(parts[0]), d: 1 };
+    }
+    const d = Math.pow(10, parts[1].length);
+    const n = Math.round(Number(str) * d);
+    return { n, d };
+  }
   const numerator = String(value?.n ?? '');
   const denominator = String(value?.d ?? '');
   if (!/^\d+$/.test(numerator) || !/^\d+$/.test(denominator)) {
@@ -354,8 +388,50 @@ export class ComposerService {
   private readonly CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
   private readonly SEQUENCE_TTL_MS = 30 * 1000; // 30 seconds
 
+  constructor(
+    @Inject(forwardRef(() => ContractsService))
+    private readonly contractsService?: ContractsService
+  ) {}
+
   getOperations() {
     return OPERATION_MANIFEST;
+  }
+
+  async validateSorobanArguments(
+    contractId: string,
+    functionName: string,
+    args: any[],
+  ): Promise<{ valid: boolean; errors: string[]; encodedArgs?: any[] }> {
+    if (!this.contractsService) {
+      throw new BadRequestException('Contract ABI functionality is not available');
+    }
+    try {
+      const encodedArgs = await this.contractsService.encodeAbiArguments(
+        contractId,
+        functionName,
+        args,
+      );
+      return { valid: true, errors: [], encodedArgs };
+    } catch (error) {
+      return {
+        valid: false,
+        errors: [error instanceof Error ? error.message : String(error)],
+      };
+    }
+  }
+
+  async getContractAbi(contractId: string) {
+    if (!this.contractsService) {
+      throw new BadRequestException('Contract ABI functionality is not available');
+    }
+    try {
+      return await this.contractsService.getAbi(contractId);
+    } catch (error: any) {
+      if (error?.status === 404 || error?.message?.toLowerCase().includes('not found')) {
+        return null;
+      }
+      throw error;
+    }
   }
 
   private getHorizonServer(network: 'testnet' | 'mainnet' = 'testnet'): Horizon.Server {
@@ -558,7 +634,9 @@ export class ComposerService {
     }
   }
 
-  async simulateTransaction(dto: SimulateTransactionDto) {
+  async simulateTransaction(
+    dto: SimulateTransactionDto,
+  ): Promise<SimulationResult> {
     try {
       const cacheKey = `${dto.network || 'testnet'}:${dto.xdr}`;
       const now = Date.now();
@@ -1074,6 +1152,8 @@ export class ComposerService {
           price: { n: Number(dto.price.n), d: Number(dto.price.d) },
         });
       case 'set_options':
+        // Validate multisig configuration if thresholds are being set
+        this.validateMultisigConfiguration(dto);
         return Operation.setOptions({
           inflationDest: dto.inflationDest,
           clearFlags: dto.clearFlags,
@@ -1083,6 +1163,10 @@ export class ComposerService {
           medThreshold: dto.medThreshold,
           highThreshold: dto.highThreshold,
           homeDomain: dto.homeDomain,
+          signer: dto.signer ? {
+            ed25519PublicKey: dto.signer.ed25519PublicKey,
+            weight: dto.signer.weight,
+          } : undefined,
         });
       case 'account_merge':
         return Operation.accountMerge({
@@ -1177,10 +1261,270 @@ export class ComposerService {
           minAmountA: validatePoolAmount('minAmountA', dto.minAmountA, true),
           minAmountB: validatePoolAmount('minAmountB', dto.minAmountB, true),
         });
+      case 'invoke_host_function':
+        return this.buildInvokeHostFunctionOperation(dto);
       default:
         throw new BadRequestException(
           `Unknown operation type: ${(dto as { type?: string }).type}`,
         );
+    }
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private buildInvokeHostFunctionOperation(dto: any): any {
+    if (!StrKey.isValidContract(dto.contractId)) {
+      throw new BadRequestException('Invalid contract ID format');
+    }
+
+    if (!dto.functionName || typeof dto.functionName !== 'string') {
+      throw new BadRequestException('Function name is required');
+    }
+
+    const args = dto.arguments || [];
+    const useAbi = dto.useAbi !== false; // Default to true
+    const rawMode = dto.rawMode === true; // Default to false
+
+    let scVals: xdr.ScVal[];
+
+    if (rawMode) {
+      // Raw mode: arguments are already ScVal objects or will be converted directly
+      scVals = this.convertRawArgumentsToScVals(args);
+    } else if (useAbi && this.contractsService) {
+      // ABI mode: validate and convert using ABI catalog
+      try {
+        const encodedArgs = this.contractsService.encodeAbiArguments(
+          dto.contractId,
+          dto.functionName,
+          args,
+          dto.wasmId
+        );
+        scVals = encodedArgs.map((arg: any) => xdr.ScVal.fromXDR(arg.xdrBase64, 'base64'));
+      } catch (error) {
+        // Fall back to native conversion if ABI is not available
+        this.logger.warn(`ABI validation failed for ${dto.contractId}.${dto.functionName}, falling back to native conversion: ${error.message}`);
+        scVals = args.map((arg: any) => nativeToScVal(arg));
+      }
+    } else {
+      // Native mode: convert using nativeToScVal
+      scVals = args.map((arg: any) => nativeToScVal(arg));
+    }
+
+    return Operation.invokeContractFunction({
+      contract: dto.contractId,
+      function: dto.functionName,
+      args: scVals,
+    });
+  }
+
+  private convertRawArgumentsToScVals(args: any[]): xdr.ScVal[] {
+    return args.map((arg) => {
+      if (typeof arg === 'object' && arg !== null) {
+        if (arg.type && arg.value !== undefined) {
+          // Structured ScVal format: { type: 'Address', value: 'G...' }
+          return this.buildScValFromType(arg.type, arg.value);
+        } else if (arg.xdr) {
+          // XDR format: { xdr: 'base64...' }
+          return xdr.ScVal.fromXDR(arg.xdr, 'base64');
+        }
+      }
+      // Fallback to native conversion
+      return nativeToScVal(arg);
+    });
+  }
+
+  private buildScValFromType(type: string, value: any): xdr.ScVal {
+    try {
+      switch (type.toLowerCase()) {
+        case 'address':
+          return Address.fromString(value).toScVal();
+        case 'bool':
+        case 'boolean':
+          return nativeToScVal(Boolean(value));
+        case 'bytes':
+          if (typeof value === 'string') {
+            return nativeToScVal(Buffer.from(value, 'hex'));
+          }
+          return nativeToScVal(Buffer.from(value));
+        case 'string':
+          return nativeToScVal(String(value));
+        case 'symbol':
+          return xdr.ScVal.scvSymbol(String(value));
+        case 'i32':
+          return nativeToScVal(parseInt(value));
+        case 'i64':
+        case 'i128':
+        case 'i256':
+          return nativeToScVal(BigInt(value));
+        case 'u32':
+          return nativeToScVal(parseInt(value));
+        case 'u64':
+        case 'u128':
+        case 'u256':
+          return nativeToScVal(BigInt(value));
+        case 'vec':
+        case 'array':
+          if (Array.isArray(value)) {
+            const elements = value.map(item => 
+              typeof item === 'object' && item.type 
+                ? this.buildScValFromType(item.type, item.value)
+                : nativeToScVal(item)
+            );
+            return xdr.ScVal.scvVec(elements);
+          }
+          throw new BadRequestException('Vec/Array type requires an array value');
+        case 'map':
+        case 'object':
+          if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
+            const entries = Object.entries(value).map(([key, val]) => {
+              const keyScVal = nativeToScVal(key);
+              const valScVal = typeof val === 'object' && (val as any).type
+                ? this.buildScValFromType((val as any).type, (val as any).value)
+                : nativeToScVal(val);
+              return new xdr.ScMapEntry({ key: keyScVal, val: valScVal });
+            });
+            return xdr.ScVal.scvMap(entries);
+          }
+          throw new BadRequestException('Map/Object type requires an object value');
+        default:
+          // Fallback to native conversion for unknown types
+          return nativeToScVal(value);
+      }
+    } catch (error) {
+      throw new BadRequestException(
+        `Failed to convert ${type} value to ScVal: ${error.message}`
+      );
+    }
+  }
+
+  private validateMultisigConfiguration(dto: any): void {
+    const masterWeight = dto.masterWeight !== undefined ? Number(dto.masterWeight) : undefined;
+    const lowThreshold = dto.lowThreshold !== undefined ? Number(dto.lowThreshold) : undefined;
+    const medThreshold = dto.medThreshold !== undefined ? Number(dto.medThreshold) : undefined;
+    const highThreshold = dto.highThreshold !== undefined ? Number(dto.highThreshold) : undefined;
+
+    // Validate threshold hierarchy
+    if (lowThreshold !== undefined && medThreshold !== undefined && lowThreshold > medThreshold) {
+      throw new BadRequestException('Low threshold cannot be greater than medium threshold');
+    }
+
+    if (medThreshold !== undefined && highThreshold !== undefined && medThreshold > highThreshold) {
+      throw new BadRequestException('Medium threshold cannot be greater than high threshold');
+    }
+
+    if (lowThreshold !== undefined && highThreshold !== undefined && lowThreshold > highThreshold) {
+      throw new BadRequestException('Low threshold cannot be greater than high threshold');
+    }
+
+    // Validate threshold ranges
+    const thresholds = [lowThreshold, medThreshold, highThreshold].filter(t => t !== undefined);
+    for (const threshold of thresholds) {
+      if (threshold < 0 || threshold > 255) {
+        throw new BadRequestException('Thresholds must be between 0 and 255');
+      }
+    }
+
+    // Validate master weight
+    if (masterWeight !== undefined && (masterWeight < 0 || masterWeight > 255)) {
+      throw new BadRequestException('Master weight must be between 0 and 255');
+    }
+
+    // Validate signer weight
+    if (dto.signer?.weight !== undefined) {
+      const signerWeight = Number(dto.signer.weight);
+      if (signerWeight < 0 || signerWeight > 255) {
+        throw new BadRequestException('Signer weight must be between 0 and 255');
+      }
+    }
+
+    // Warning: Check if thresholds can be satisfied
+    if (masterWeight !== undefined && highThreshold !== undefined && masterWeight < highThreshold) {
+      this.logger.warn(`Master weight (${masterWeight}) is less than high threshold (${highThreshold}). Additional signers will be required.`);
+    }
+  }
+
+  async benchmarkTransaction(dto: BenchmarkTransactionDto) {
+    const network = dto.network || 'testnet';
+    const txCount = Math.min(Math.max(dto.transactionCount || 10, 1), 50);
+    const concurrency = Math.min(Math.max(dto.concurrency || 5, 1), 20);
+
+    const baseTx = 
+      new Transaction(dto.xdr, this.networkPassphrase(network));
+    const server = this.getHorizonServer(dto.network);
+
+    // Benchmark metrics
+    const results: {
+      transactionIndex: number;
+      submissionTime: number;
+      success: boolean;
+      hash?: string;
+      errorMessage?: string;
+    }[] = [];
+
+    let successCount = 0;
+    let failureCount = 0;
+    let totalSubmissionTime = 0;
+
+    const startTime = Date.now();
+
+    // Process transactions in batches for concurrency control
+    const batchSize = concurrency;
+    for (let batchStart = 0; batchStart < txCount; batchStart += batchSize) {
+      const batchEnd = Math.min(batchStart + batchSize, txCount);
+      const batchPromises = [];
+
+      for (let i = batchStart; i < batchEnd; i++) {
+        const promise = (async (transactionIndex: number) => {
+          const txStartTime = Date.now();
+          try {
+            const submissionResult = await server.submitTransaction(baseTx);
+            const submissionTime = Date.now() - txStartTime;
+            totalSubmissionTime += submissionTime;
+            successCount++;
+            
+            results.push({
+              transactionIndex,
+              submissionTime,
+              success: true,
+              hash: submissionResult.hash,
+            });
+          } catch (error) {
+            const submissionTime = Date.now() - txStartTime;
+            totalSubmissionTime += submissionTime;
+            failureCount++;
+            
+            results.push({
+              transactionIndex,
+              submissionTime,
+              success: false,
+              errorMessage: error instanceof Error ? error.message : String(error),
+            });
+          }
+        })(i);
+
+        batchPromises.push(promise);
+      }
+
+      // Wait for the current batch to complete before starting the next
+      await Promise.all(batchPromises);
+    }
+
+    const totalTime = Date.now() - startTime;
+
+    try {
+      return {
+        summary: {
+          totalTransactions: txCount,
+          successCount,
+          failureCount,
+          totalTime,
+          averageSubmissionTime: totalSubmissionTime / txCount,
+          transactionsPerSecond: (successCount / totalTime) * 1000,
+        },
+        results: results.sort((a, b) => a.transactionIndex - b.transactionIndex),
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new BadRequestException(`Benchmark failed: ${message}`);
     }
   }
 
