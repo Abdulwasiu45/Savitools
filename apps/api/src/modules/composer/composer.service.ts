@@ -19,6 +19,7 @@ import {
 } from '@stellar/stellar-sdk';
 import { BuildTransactionDto, OperationDto } from './dto/build-transaction.dto';
 import { SimulateTransactionDto } from './dto/simulate-transaction.dto';
+import { SimulateWithDiffDto, SimulationWithDiffResult, OperationEffect, StateDiff } from './dto/simulate-with-diff.dto';
 import { BenchmarkTransactionDto } from './dto/benchmark-transaction.dto';
 import { FeeBumpDto } from './dto/fee-bump.dto';
 
@@ -667,6 +668,265 @@ export class ComposerService {
         ledger: null,
       };
     }
+  }
+
+  /**
+   * Simulate transaction with detailed state diff showing before/after changes
+   */
+  async simulateWithDiff(dto: SimulateWithDiffDto): Promise<SimulationWithDiffResult> {
+    // First run the standard simulation
+    const baseSimulation = await this.simulateTransaction({
+      xdr: dto.xdr,
+      network: dto.network,
+    });
+
+    if (!dto.includeDiff) {
+      return {
+        ...baseSimulation,
+        effects: [],
+        stateDiff: [],
+        summary: {
+          accountsAffected: 0,
+          balanceChanges: 0,
+          trustlineChanges: 0,
+          signerChanges: 0,
+          dataChanges: 0,
+        },
+      } as SimulationWithDiffResult;
+    }
+
+    try {
+      const tx = new Transaction(
+        dto.xdr,
+        this.networkPassphrase(dto.network || 'testnet'),
+      );
+
+      const effects = this.extractOperationEffects(tx);
+      const stateDiff = this.buildStateDiff(tx);
+      const summary = this.buildSummary(stateDiff);
+
+      return {
+        ...baseSimulation,
+        effects,
+        stateDiff,
+        summary,
+      } as SimulationWithDiffResult;
+    } catch (err: unknown) {
+      // If diff extraction fails, return base simulation
+      this.logger.warn(`Failed to extract diff: ${err instanceof Error ? err.message : String(err)}`);
+      return {
+        ...baseSimulation,
+        effects: [],
+        stateDiff: [],
+      } as SimulationWithDiffResult;
+    }
+  }
+
+  /**
+   * Extract operation effects from transaction
+   */
+  private extractOperationEffects(tx: Transaction): OperationEffect[] {
+    const effects: OperationEffect[] = [];
+
+    tx.operations.forEach((op) => {
+      switch (op.type) {
+        case 'payment':
+          effects.push({
+            type: 'payment',
+            description: `Transfer ${op.amount} ${op.asset.isNative() ? 'XLM' : op.asset.code} to ${op.destination}`,
+            account: op.destination,
+            asset: op.asset.isNative() ? 'native:XLM' : `${op.asset.code}:${op.asset.issuer}`,
+            amount: op.amount,
+          });
+          break;
+
+        case 'createAccount':
+          effects.push({
+            type: 'create_account',
+            description: `Create account ${op.destination} with ${op.startingBalance} XLM`,
+            account: op.destination,
+            amount: op.startingBalance,
+          });
+          break;
+
+        case 'changeTrust':
+          if (op.line && 'getCode' in op.line) {
+            effects.push({
+              type: 'change_trust',
+              description: `${op.limit === '0' ? 'Remove' : 'Add/modify'} trustline for ${op.line.getCode()}`,
+              account: tx.source,
+              asset: `${op.line.getCode()}:${op.line.getIssuer()}`,
+              amount: op.limit,
+            });
+          }
+          break;
+
+        case 'manageData':
+          effects.push({
+            type: 'manage_data',
+            description: `${op.value === null ? 'Remove' : 'Set'} data entry "${op.name}"`,
+            account: tx.source,
+            data: { key: op.name, value: op.value },
+          });
+          break;
+
+        case 'setOptions':
+          if (op.signer) {
+            effects.push({
+              type: 'set_signer',
+              description: `${op.signer.weight === 0 ? 'Remove' : 'Add/modify'} signer`,
+              account: tx.source,
+              data: { signer: op.signer },
+            });
+          }
+          if (op.lowThreshold !== undefined || op.medThreshold !== undefined || op.highThreshold !== undefined) {
+            effects.push({
+              type: 'set_thresholds',
+              description: 'Modify account thresholds',
+              account: tx.source,
+              data: {
+                low: op.lowThreshold,
+                med: op.medThreshold,
+                high: op.highThreshold,
+              },
+            });
+          }
+          break;
+
+        case 'accountMerge':
+          effects.push({
+            type: 'account_merge',
+            description: `Merge account into ${op.destination}`,
+            account: tx.source,
+            data: { destination: op.destination },
+          });
+          break;
+
+        default:
+          effects.push({
+            type: op.type,
+            description: `Perform ${op.type} operation`,
+            account: tx.source,
+          });
+      }
+    });
+
+    return effects;
+  }
+
+  /**
+   * Build state diff showing before/after changes per account
+   */
+  private buildStateDiff(tx: Transaction): StateDiff[] {
+    const accountDiffs = new Map<string, StateDiff>();
+
+    const getOrCreateDiff = (account: string): StateDiff => {
+      if (!accountDiffs.has(account)) {
+        accountDiffs.set(account, {
+          account,
+          balanceChanges: [],
+          trustlineChanges: [],
+          signerChanges: [],
+          dataEntryChanges: [],
+        });
+      }
+      return accountDiffs.get(account)!;
+    };
+
+    tx.operations.forEach((op) => {
+      const source = op.source || tx.source;
+
+      switch (op.type) {
+        case 'payment': {
+          const sourceDiff = getOrCreateDiff(source);
+          const destDiff = getOrCreateDiff(op.destination);
+
+          sourceDiff.balanceChanges.push({
+            asset: op.asset.isNative() ? 'native:XLM' : `${op.asset.code}:${op.asset.issuer}`,
+            before: null,
+            after: 'TBD',
+            change: `-${op.amount}`,
+          });
+
+          destDiff.balanceChanges.push({
+            asset: op.asset.isNative() ? 'native:XLM' : `${op.asset.code}:${op.asset.issuer}`,
+            before: null,
+            after: 'TBD',
+            change: `+${op.amount}`,
+          });
+          break;
+        }
+
+        case 'createAccount': {
+          const newAccountDiff = getOrCreateDiff(op.destination);
+          newAccountDiff.balanceChanges.push({
+            asset: 'native:XLM',
+            before: null,
+            after: op.startingBalance,
+            change: `+${op.startingBalance}`,
+          });
+          break;
+        }
+
+        case 'changeTrust': {
+          const diff = getOrCreateDiff(source);
+          if (op.line && 'getCode' in op.line) {
+            diff.trustlineChanges.push({
+              asset: `${op.line.getCode()}:${op.line.getIssuer()}`,
+              action: op.limit === '0' ? 'removed' : 'added',
+              limitAfter: op.limit === '0' ? undefined : op.limit,
+            });
+          }
+          break;
+        }
+
+        case 'manageData': {
+          const diff = getOrCreateDiff(source);
+          diff.dataEntryChanges.push({
+            key: op.name,
+            action: op.value === null ? 'removed' : 'added',
+            valueAfter: op.value?.toString('base64'),
+          });
+          break;
+        }
+
+        case 'setOptions': {
+          const diff = getOrCreateDiff(source);
+          
+          if (op.signer) {
+            diff.signerChanges.push({
+              key: 'signer-key',
+              action: op.signer.weight === 0 ? 'removed' : 'added',
+              weight: typeof op.signer.weight === 'string' ? parseInt(op.signer.weight, 10) : op.signer.weight,
+            });
+          }
+
+          if (op.lowThreshold !== undefined || op.medThreshold !== undefined || op.highThreshold !== undefined) {
+            diff.thresholdChanges = {
+              lowAfter: op.lowThreshold,
+              medAfter: op.medThreshold,
+              highAfter: op.highThreshold,
+            };
+          }
+          break;
+        }
+      }
+    });
+
+    return Array.from(accountDiffs.values());
+  }
+
+  /**
+   * Build summary statistics for the diff
+   */
+  private buildSummary(stateDiff: StateDiff[]) {
+    return {
+      accountsAffected: stateDiff.length,
+      balanceChanges: stateDiff.reduce((sum, diff) => sum + diff.balanceChanges.length, 0),
+      trustlineChanges: stateDiff.reduce((sum, diff) => sum + diff.trustlineChanges.length, 0),
+      signerChanges: stateDiff.reduce((sum, diff) => sum + diff.signerChanges.length, 0),
+      dataChanges: stateDiff.reduce((sum, diff) => sum + diff.dataEntryChanges.length, 0),
+    };
   }
 
   async benchmarkTransaction(dto: BenchmarkTransactionDto) {

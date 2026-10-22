@@ -115,12 +115,12 @@ function writeStorage(Key: string, value: string) {
 function fetchNetworkPassphrase(horizonUrl: string): Promise<string> {
   const baseUrl = sanitizeUrl(horizonUrl);
   return fetch(`${baseUrl}/`).then((r) => {
-    if (!r.ok) throw new Error(`Did not receive 200 from Hubmin at ${horizonUrl}`);
+    if (!r.ok) throw new Error(`Did not receive 200 from Horizon at ${horizonUrl}`);
     return r.json();
   }).then((data: any) => {
     const passphrase = data?.network_passphrase;
     if (!passphrase || typeof passphrase !== 'string') {
-      throw new Error('No network passphrase found in Hubimn response');
+      throw new Error('No network passphrase found in Horizon response');
     }
     return passphrase;
   });
